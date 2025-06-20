@@ -26,6 +26,33 @@ const PORT_PRESETS = {
   custom: { port: null, name: 'Custom Port', protocol: 'tcp', description: 'Custom TCP/UDP port' }
 };
 
+// Function to generate a random port in safe range
+const generateRandomPort = () => {
+  // Use port range 10000-60000 to avoid conflicts with system ports
+  return Math.floor(Math.random() * 50000) + 10000;
+};
+
+// Function to find an available port
+const findAvailablePort = async (location, maxAttempts = 20) => {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const port = generateRandomPort();
+    
+    // Check if port is already in use in this location
+    const { data: existingPort } = await supabase
+      .from('tunnels')
+      .select('id')
+      .eq('location', location)
+      .eq('remote_port', port)
+      .single();
+
+    if (!existingPort) {
+      return port;
+    }
+  }
+  
+  throw new Error('Unable to find available port after multiple attempts');
+};
+
 // Get user tunnels with enhanced port information
 router.get('/', authenticateToken, async (req, res) => {
   try {
@@ -47,21 +74,25 @@ router.get('/', authenticateToken, async (req, res) => {
     const formattedTunnels = tunnels.map(tunnel => {
       const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
       
-      // FIXED: Ensure remote_port is always defined
-      const remotePort = tunnel.remote_port || tunnel.local_port || preset.port || 80;
+      // FIXED: Proper port handling based on protocol
       const protocol = tunnel.protocol || preset.protocol || 'tcp';
-      
-      // FIXED: Generate proper tunnel URL based on protocol
+      let remotePort = tunnel.remote_port;
       let tunnelUrl;
+      
       if (protocol === 'http') {
+        // For HTTP, no specific port needed in URL
         tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
+        remotePort = null; // HTTP doesn't need remote port
       } else {
+        // For TCP/UDP, ensure we have a valid port
+        if (!remotePort) {
+          remotePort = generateRandomPort(); // Fallback, but this shouldn't happen
+        }
         tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${remotePort}`;
       }
 
       return {
         ...tunnel,
-        // Ensure remote_port is never undefined
         remote_port: remotePort,
         protocol: protocol,
         location_name: tunnel.server_locations?.name || tunnel.location,
@@ -92,7 +123,7 @@ router.get('/presets', (req, res) => {
   res.json(PORT_PRESETS);
 });
 
-// Create tunnel with port support
+// Create tunnel with proper port assignment
 router.post('/', authenticateToken, [
   body('subdomain')
     .trim()
@@ -165,34 +196,41 @@ router.post('/', authenticateToken, [
     // Determine final protocol
     const finalProtocol = protocol || preset.protocol || 'tcp';
 
-    // FIXED: For TCP/UDP services, assign a unique remote port if not specified
-    let finalRemotePort = remote_port;
+    // FIXED: Proper port assignment logic
+    let finalRemotePort = null;
     
     if (finalProtocol === 'http') {
-      // For HTTP, no remote port needed (uses standard 80/443)
+      // For HTTP, no remote port needed (uses standard 80/443 via reverse proxy)
       finalRemotePort = null;
-    } else if (!finalRemotePort) {
-      // Generate a random port in the range 10000-60000 for TCP/UDP
-      finalRemotePort = Math.floor(Math.random() * 50000) + 10000;
-      
-      // Check if port is already in use and find an available one
-      let attempts = 0;
-      while (attempts < 10) {
+      console.log(`🌐 HTTP tunnel - no remote port needed`);
+    } else {
+      // For TCP/UDP, we MUST assign a unique remote port
+      if (remote_port) {
+        // User specified a port, check if it's available
         const { data: existingPort } = await supabase
           .from('tunnels')
           .select('id')
           .eq('location', location)
-          .eq('remote_port', finalRemotePort)
+          .eq('remote_port', remote_port)
           .single();
 
-        if (!existingPort) break;
+        if (existingPort) {
+          return res.status(409).json({ 
+            message: `Port ${remote_port} is already in use in ${location}` 
+          });
+        }
         
-        finalRemotePort = Math.floor(Math.random() * 50000) + 10000;
-        attempts++;
-      }
-      
-      if (attempts >= 10) {
-        return res.status(500).json({ message: 'Unable to assign available port' });
+        finalRemotePort = remote_port;
+        console.log(`🎯 Using user-specified port: ${finalRemotePort}`);
+      } else {
+        // Auto-assign a random port in safe range
+        try {
+          finalRemotePort = await findAvailablePort(location);
+          console.log(`🎲 Auto-assigned random port: ${finalRemotePort}`);
+        } catch (error) {
+          console.error('❌ Port assignment failed:', error);
+          return res.status(500).json({ message: 'Unable to assign available port' });
+        }
       }
     }
 
@@ -209,7 +247,7 @@ router.post('/', authenticateToken, [
         location,
         service_type,
         local_port,
-        remote_port: finalRemotePort, // This will be null for HTTP, or a number for TCP/UDP
+        remote_port: finalRemotePort, // null for HTTP, number for TCP/UDP
         protocol: finalProtocol,
         connection_token: connectionToken,
         status: 'inactive',
@@ -223,22 +261,27 @@ router.post('/', authenticateToken, [
       return res.status(500).json({ message: 'Failed to create tunnel' });
     }
 
-    // FIXED: Prepare response with proper port handling
-    const displayPort = finalRemotePort || 80; // Use 80 as default for display
+    // FIXED: Prepare response with proper URLs and commands
+    let tunnelUrl, clientCommand;
     
-    const tunnelUrl = finalProtocol === 'http' 
-      ? `https://${subdomain}.${location}.tunlify.biz.id`
-      : `${subdomain}.${location}.tunlify.biz.id:${finalRemotePort}`;
+    if (finalProtocol === 'http') {
+      tunnelUrl = `https://${subdomain}.${location}.tunlify.biz.id`;
+      clientCommand = `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port}`;
+    } else {
+      tunnelUrl = `${subdomain}.${location}.tunlify.biz.id:${finalRemotePort}`;
+      clientCommand = `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port} -protocol=${finalProtocol}`;
+    }
 
-    const clientCommand = finalProtocol === 'http'
-      ? `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port}`
-      : `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port} -protocol=${finalProtocol}`;
-
-    console.log(`✅ ${service_type.toUpperCase()} tunnel created successfully: ${tunnelUrl}`);
+    console.log(`✅ ${service_type.toUpperCase()} tunnel created successfully:`);
+    console.log(`   URL: ${tunnelUrl}`);
+    console.log(`   Protocol: ${finalProtocol.toUpperCase()}`);
+    console.log(`   Local: 127.0.0.1:${local_port}`);
+    if (finalRemotePort) {
+      console.log(`   Remote Port: ${finalRemotePort}`);
+    }
     
     res.status(201).json({
       ...tunnel,
-      // Ensure remote_port is never undefined in response
       remote_port: finalRemotePort,
       service_info: {
         name: preset.name,
@@ -247,7 +290,7 @@ router.post('/', authenticateToken, [
       },
       connection_info: {
         host: `${subdomain}.${location}.tunlify.biz.id`,
-        port: finalRemotePort || 80, // Fallback for display
+        port: finalRemotePort,
         protocol: finalProtocol
       },
       tunnel_url: tunnelUrl,
@@ -269,78 +312,82 @@ function generateConnectionExamples(serviceType, subdomain, location, port, prot
   const host = `${subdomain}.${location}.tunlify.biz.id`;
   const examples = {};
 
-  // FIXED: Handle cases where port might be null (for HTTP)
-  const displayPort = port || 80;
+  // For HTTP, no port needed in examples
+  if (protocol === 'http') {
+    examples.browser = `https://${host}`;
+    examples.curl = `curl https://${host}`;
+    return examples;
+  }
+
+  // For TCP/UDP, port is required
+  if (!port) {
+    examples.error = 'Port not assigned for TCP/UDP service';
+    return examples;
+  }
 
   switch (serviceType) {
     case 'ssh':
-      examples.ssh = `ssh username@${host} -p ${displayPort}`;
-      examples.scp = `scp -P ${displayPort} file.txt username@${host}:/path/`;
-      examples.sftp = `sftp -P ${displayPort} username@${host}`;
+      examples.ssh = `ssh username@${host} -p ${port}`;
+      examples.scp = `scp -P ${port} file.txt username@${host}:/path/`;
+      examples.sftp = `sftp -P ${port} username@${host}`;
       break;
 
     case 'rdp':
-      examples.windows = `mstsc /v:${host}:${displayPort}`;
-      examples.remmina = `remmina rdp://${host}:${displayPort}`;
-      examples.freerdp = `xfreerdp /v:${host}:${displayPort} /u:username`;
+      examples.windows = `mstsc /v:${host}:${port}`;
+      examples.remmina = `remmina rdp://${host}:${port}`;
+      examples.freerdp = `xfreerdp /v:${host}:${port} /u:username`;
       break;
 
     case 'mysql':
-      examples.mysql_cli = `mysql -h ${host} -P ${displayPort} -u username -p database_name`;
-      examples.connection_string = `mysql://username:password@${host}:${displayPort}/database_name`;
-      examples.workbench = `Host: ${host}, Port: ${displayPort}`;
+      examples.mysql_cli = `mysql -h ${host} -P ${port} -u username -p database_name`;
+      examples.connection_string = `mysql://username:password@${host}:${port}/database_name`;
+      examples.workbench = `Host: ${host}, Port: ${port}`;
       break;
 
     case 'postgresql':
-      examples.psql = `psql -h ${host} -p ${displayPort} -U username -d database_name`;
-      examples.connection_string = `postgresql://username:password@${host}:${displayPort}/database_name`;
-      examples.pgadmin = `Host: ${host}, Port: ${displayPort}`;
+      examples.psql = `psql -h ${host} -p ${port} -U username -d database_name`;
+      examples.connection_string = `postgresql://username:password@${host}:${port}/database_name`;
+      examples.pgadmin = `Host: ${host}, Port: ${port}`;
       break;
 
     case 'mongodb':
-      examples.mongo_cli = `mongo mongodb://${host}:${displayPort}/database_name`;
-      examples.connection_string = `mongodb://username:password@${host}:${displayPort}/database_name`;
-      examples.compass = `mongodb://${host}:${displayPort}`;
+      examples.mongo_cli = `mongo mongodb://${host}:${port}/database_name`;
+      examples.connection_string = `mongodb://username:password@${host}:${port}/database_name`;
+      examples.compass = `mongodb://${host}:${port}`;
       break;
 
     case 'redis':
-      examples.redis_cli = `redis-cli -h ${host} -p ${displayPort}`;
-      examples.connection_string = `redis://${host}:${displayPort}`;
+      examples.redis_cli = `redis-cli -h ${host} -p ${port}`;
+      examples.connection_string = `redis://${host}:${port}`;
       break;
 
     case 'vnc':
-      examples.vnc_viewer = `${host}:${displayPort}`;
-      examples.tightvnc = `vncviewer ${host}:${displayPort}`;
+      examples.vnc_viewer = `${host}:${port}`;
+      examples.tightvnc = `vncviewer ${host}:${port}`;
       break;
 
     case 'ftp':
-      examples.ftp_cli = `ftp ${host} ${displayPort}`;
-      examples.filezilla = `Host: ${host}, Port: ${displayPort}, Protocol: FTP`;
+      examples.ftp_cli = `ftp ${host} ${port}`;
+      examples.filezilla = `Host: ${host}, Port: ${port}, Protocol: FTP`;
       break;
 
     case 'smtp':
-      examples.smtp_config = `SMTP Server: ${host}, Port: ${displayPort}`;
-      examples.telnet_test = `telnet ${host} ${displayPort}`;
+      examples.smtp_config = `SMTP Server: ${host}, Port: ${port}`;
+      examples.telnet_test = `telnet ${host} ${port}`;
       break;
 
     case 'minecraft':
-      examples.minecraft_client = `Server Address: ${host}:${displayPort}`;
-      examples.direct_connect = `${host}:${displayPort}`;
-      break;
-
-    case 'http':
-    case 'https':
-      examples.browser = `https://${host}`;
-      examples.curl = `curl https://${host}`;
+      examples.minecraft_client = `Server Address: ${host}:${port}`;
+      examples.direct_connect = `${host}:${port}`;
       break;
 
     default:
       if (protocol === 'tcp') {
-        examples.tcp = `telnet ${host} ${displayPort}`;
+        examples.tcp = `telnet ${host} ${port}`;
+        examples.netcat = `nc ${host} ${port}`;
       } else if (protocol === 'udp') {
-        examples.udp = `nc -u ${host} ${displayPort}`;
-      } else {
-        examples.generic = `Connect to ${host}:${displayPort} using ${protocol.toUpperCase()} protocol`;
+        examples.udp = `nc -u ${host} ${port}`;
+        examples.netcat_udp = `nc -u ${host} ${port}`;
       }
   }
 
@@ -488,25 +535,29 @@ router.post('/auth', [
       .eq('id', tunnel.id);
 
     const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
-
-    // FIXED: Handle remote_port properly for display
-    const displayPort = tunnel.remote_port || 80;
     const protocol = tunnel.protocol || preset.protocol || 'tcp';
     
-    const tunnelUrl = protocol === 'http' 
-      ? `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`
-      : `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${displayPort}`;
+    // FIXED: Proper tunnel URL generation for client response
+    let tunnelUrl;
+    if (protocol === 'http') {
+      tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
+    } else {
+      tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`;
+    }
 
     console.log(`🔗 Client connected: ${tunnelUrl}`);
     console.log(`👤 User: ${tunnel.users.email}`);
-    console.log(`🔧 Service: ${preset.name} (${protocol})`);
+    console.log(`🔧 Service: ${preset.name} (${protocol.toUpperCase()})`);
+    if (tunnel.remote_port) {
+      console.log(`🎯 Remote Port: ${tunnel.remote_port}`);
+    }
 
     res.json({
       tunnel_id: tunnel.id,
       subdomain: tunnel.subdomain,
       location: tunnel.location,
       local_port: tunnel.local_port,
-      remote_port: tunnel.remote_port, // This might be null for HTTP
+      remote_port: tunnel.remote_port, // null for HTTP, number for TCP/UDP
       protocol: protocol,
       service_type: tunnel.service_type,
       service_name: preset.name,
