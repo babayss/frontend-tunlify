@@ -42,7 +42,7 @@ const findAvailablePort = async (location, maxAttempts = 20) => {
       .from('tunnels')
       .select('id')
       .eq('location', location)
-      .eq('remote_port', port)
+      .eq('target_port', port)
       .single();
 
     if (!existingPort) {
@@ -53,7 +53,7 @@ const findAvailablePort = async (location, maxAttempts = 20) => {
   throw new Error('Unable to find available port after multiple attempts');
 };
 
-// Get user tunnels with enhanced port information
+// Get user tunnels with enhanced information
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const { data: tunnels, error } = await supabase
@@ -70,31 +70,40 @@ router.get('/', authenticateToken, async (req, res) => {
       return res.status(500).json({ message: 'Failed to fetch tunnels' });
     }
 
-    // Format response with port information
+    // Format response with enhanced information
     const formattedTunnels = tunnels.map(tunnel => {
-      const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
+      // Determine service type from target_port if not explicitly set
+      let serviceType = 'custom';
+      let preset = PORT_PRESETS.custom;
       
-      // FIXED: Proper port handling based on protocol
-      const protocol = tunnel.protocol || preset.protocol || 'tcp';
-      let remotePort = tunnel.remote_port;
-      let tunnelUrl;
-      
-      if (protocol === 'http') {
-        // For HTTP, no specific port needed in URL
-        tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
-        remotePort = null; // HTTP doesn't need remote port
-      } else {
-        // For TCP/UDP, ensure we have a valid port
-        if (!remotePort) {
-          remotePort = generateRandomPort(); // Fallback, but this shouldn't happen
+      if (tunnel.target_port) {
+        // Find matching preset by port
+        for (const [key, value] of Object.entries(PORT_PRESETS)) {
+          if (value.port === tunnel.target_port) {
+            serviceType = key;
+            preset = value;
+            break;
+          }
         }
-        tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${remotePort}`;
+      }
+      
+      // Determine protocol - HTTP for ports 80/443, TCP for others
+      const protocol = tunnel.target_port === 80 || tunnel.target_port === 443 ? 'http' : 'tcp';
+      
+      // Build tunnel URL
+      let tunnelUrl;
+      if (protocol === 'http') {
+        tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
+      } else {
+        tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.target_port}`;
       }
 
       return {
         ...tunnel,
-        remote_port: remotePort,
+        service_type: serviceType,
         protocol: protocol,
+        local_port: tunnel.target_port, // For compatibility with frontend
+        remote_port: tunnel.target_port,
         location_name: tunnel.server_locations?.name || tunnel.location,
         server_ip: tunnel.server_locations?.ip_address,
         service_info: {
@@ -105,7 +114,7 @@ router.get('/', authenticateToken, async (req, res) => {
         tunnel_url: tunnelUrl,
         connection_info: {
           host: `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`,
-          port: remotePort,
+          port: tunnel.target_port,
           protocol: protocol
         }
       };
@@ -123,7 +132,7 @@ router.get('/presets', (req, res) => {
   res.json(PORT_PRESETS);
 });
 
-// Create tunnel with proper port assignment
+// Create tunnel with proper port assignment using existing schema
 router.post('/', authenticateToken, [
   body('subdomain')
     .trim()
@@ -208,22 +217,23 @@ router.post('/', authenticateToken, [
     const finalProtocol = protocol || preset.protocol || 'tcp';
     console.log(`🔍 Final protocol: ${finalProtocol}`);
 
-    // CRITICAL FIX: Proper port assignment logic
-    let finalRemotePort = null;
+    // CRITICAL FIX: Proper port assignment using existing schema
+    let targetPort;
+    let targetIp = locationData.ip_address; // Use server IP as target
     
     if (finalProtocol === 'http') {
-      // For HTTP, no remote port needed (uses standard 80/443 via reverse proxy)
-      finalRemotePort = null;
-      console.log(`🌐 HTTP tunnel - no remote port needed`);
+      // For HTTP, use standard ports
+      targetPort = 80; // Will be handled by reverse proxy
+      console.log(`🌐 HTTP tunnel - using port 80 for reverse proxy`);
     } else {
-      // For TCP/UDP, we MUST assign a unique remote port
+      // For TCP/UDP, assign a unique port
       if (remote_port) {
         // User specified a port, check if it's available
         const { data: existingPort } = await supabase
           .from('tunnels')
           .select('id')
           .eq('location', location)
-          .eq('remote_port', remote_port)
+          .eq('target_port', remote_port)
           .single();
 
         if (existingPort) {
@@ -232,13 +242,13 @@ router.post('/', authenticateToken, [
           });
         }
         
-        finalRemotePort = parseInt(remote_port);
-        console.log(`🎯 Using user-specified port: ${finalRemotePort}`);
+        targetPort = parseInt(remote_port);
+        console.log(`🎯 Using user-specified port: ${targetPort}`);
       } else {
         // Auto-assign a random port in safe range
         try {
-          finalRemotePort = await findAvailablePort(location);
-          console.log(`🎲 Auto-assigned random port: ${finalRemotePort}`);
+          targetPort = await findAvailablePort(location);
+          console.log(`🎲 Auto-assigned random port: ${targetPort}`);
         } catch (error) {
           console.error('❌ Port assignment failed:', error);
           return res.status(500).json({ message: 'Unable to assign available port' });
@@ -250,15 +260,13 @@ router.post('/', authenticateToken, [
     const connectionToken = crypto.randomBytes(32).toString('hex');
     console.log(`🔑 Generated connection token: ${connectionToken.substring(0, 8)}...`);
 
-    // CRITICAL: Ensure we have valid data for database insert
+    // CRITICAL: Use existing database schema
     const tunnelData = {
       user_id: req.user.id,
       subdomain,
       location,
-      service_type,
-      local_port: parseInt(local_port),
-      remote_port: finalRemotePort, // null for HTTP, number for TCP/UDP
-      protocol: finalProtocol,
+      target_ip: targetIp,
+      target_port: targetPort,
       connection_token: connectionToken,
       status: 'inactive',
       client_connected: false,
@@ -287,7 +295,7 @@ router.post('/', authenticateToken, [
       tunnelUrl = `https://${subdomain}.${location}.tunlify.biz.id`;
       clientCommand = `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port}`;
     } else {
-      tunnelUrl = `${subdomain}.${location}.tunlify.biz.id:${finalRemotePort}`;
+      tunnelUrl = `${subdomain}.${location}.tunlify.biz.id:${targetPort}`;
       clientCommand = `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port} -protocol=${finalProtocol}`;
     }
 
@@ -295,13 +303,14 @@ router.post('/', authenticateToken, [
     console.log(`   URL: ${tunnelUrl}`);
     console.log(`   Protocol: ${finalProtocol.toUpperCase()}`);
     console.log(`   Local: 127.0.0.1:${local_port}`);
-    if (finalRemotePort) {
-      console.log(`   Remote Port: ${finalRemotePort}`);
-    }
+    console.log(`   Target: ${targetIp}:${targetPort}`);
     
     const responseData = {
       ...tunnel,
-      remote_port: finalRemotePort,
+      service_type: service_type,
+      protocol: finalProtocol,
+      local_port: local_port,
+      remote_port: targetPort,
       service_info: {
         name: preset.name,
         description: preset.description,
@@ -309,14 +318,14 @@ router.post('/', authenticateToken, [
       },
       connection_info: {
         host: `${subdomain}.${location}.tunlify.biz.id`,
-        port: finalRemotePort,
+        port: targetPort,
         protocol: finalProtocol
       },
       tunnel_url: tunnelUrl,
       setup_instructions: {
         download_url: 'https://github.com/tunlify/client/releases/latest',
         command: clientCommand,
-        connection_examples: generateConnectionExamples(service_type, subdomain, location, finalRemotePort, finalProtocol)
+        connection_examples: generateConnectionExamples(service_type, subdomain, location, targetPort, finalProtocol)
       }
     };
 
@@ -444,8 +453,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
       return res.status(500).json({ message: 'Failed to delete tunnel' });
     }
 
-    const portDisplay = tunnel.remote_port ? `:${tunnel.remote_port}` : '';
-    console.log(`🗑️ Tunnel deleted: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id${portDisplay}`);
+    console.log(`🗑️ Tunnel deleted: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.target_port}`);
 
     res.json({ message: 'Tunnel deleted successfully' });
 
@@ -505,8 +513,7 @@ router.patch('/:id/status', authenticateToken, [
       return res.status(500).json({ message: 'Failed to update tunnel status' });
     }
 
-    const portDisplay = tunnel.remote_port ? `:${tunnel.remote_port}` : '';
-    console.log(`🔄 Tunnel status updated: ${tunnel.subdomain}.${tunnel.location}${portDisplay} -> ${status} (connected: ${client_connected})`);
+    console.log(`🔄 Tunnel status updated: ${tunnel.subdomain}.${tunnel.location}:${tunnel.target_port} -> ${status} (connected: ${client_connected})`);
 
     res.json(updatedTunnel);
 
@@ -516,7 +523,7 @@ router.patch('/:id/status', authenticateToken, [
   }
 });
 
-// CRITICAL FIX: Client authentication endpoint with proper port handling
+// CRITICAL FIX: Client authentication endpoint with proper schema
 router.post('/auth', [
   body('connection_token').isLength({ min: 32, max: 64 })
 ], async (req, res) => {
@@ -551,10 +558,8 @@ router.post('/auth', [
       id: tunnel.id,
       subdomain: tunnel.subdomain,
       location: tunnel.location,
-      service_type: tunnel.service_type,
-      protocol: tunnel.protocol,
-      local_port: tunnel.local_port,
-      remote_port: tunnel.remote_port
+      target_ip: tunnel.target_ip,
+      target_port: tunnel.target_port
     });
 
     // Update tunnel as connected
@@ -567,39 +572,52 @@ router.post('/auth', [
       })
       .eq('id', tunnel.id);
 
-    const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
-    const protocol = tunnel.protocol || preset.protocol || 'tcp';
+    // Determine service type and protocol from target_port
+    let serviceType = 'custom';
+    let preset = PORT_PRESETS.custom;
+    
+    if (tunnel.target_port) {
+      for (const [key, value] of Object.entries(PORT_PRESETS)) {
+        if (value.port === tunnel.target_port) {
+          serviceType = key;
+          preset = value;
+          break;
+        }
+      }
+    }
+    
+    const protocol = tunnel.target_port === 80 || tunnel.target_port === 443 ? 'http' : 'tcp';
     
     // CRITICAL FIX: Proper tunnel URL generation for client response
     let tunnelUrl;
     if (protocol === 'http') {
       tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
     } else {
-      // ENSURE we have a valid remote_port for TCP/UDP
-      if (!tunnel.remote_port) {
-        console.error(`❌ No remote port for TCP/UDP tunnel: ${tunnel.id}`);
-        return res.status(500).json({ message: 'Invalid tunnel configuration - missing remote port' });
+      // ENSURE we have a valid target_port for TCP/UDP
+      if (!tunnel.target_port) {
+        console.error(`❌ No target port for TCP/UDP tunnel: ${tunnel.id}`);
+        return res.status(500).json({ message: 'Invalid tunnel configuration - missing target port' });
       }
-      tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`;
+      tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.target_port}`;
     }
 
     console.log(`🔗 Client connected: ${tunnelUrl}`);
     console.log(`👤 User: ${tunnel.users.email}`);
     console.log(`🔧 Service: ${preset.name} (${protocol.toUpperCase()})`);
-    if (tunnel.remote_port) {
-      console.log(`🎯 Remote Port: ${tunnel.remote_port}`);
-    }
+    console.log(`🎯 Target: ${tunnel.target_ip}:${tunnel.target_port}`);
 
     const responseData = {
       tunnel_id: tunnel.id,
       subdomain: tunnel.subdomain,
       location: tunnel.location,
-      local_port: tunnel.local_port,
-      remote_port: tunnel.remote_port, // null for HTTP, number for TCP/UDP
+      local_port: tunnel.target_port, // For client compatibility
+      remote_port: tunnel.target_port,
       protocol: protocol,
-      service_type: tunnel.service_type,
+      service_type: serviceType,
       service_name: preset.name,
       tunnel_url: tunnelUrl,
+      target_ip: tunnel.target_ip,
+      target_port: tunnel.target_port,
       server_ip: tunnel.server_locations.ip_address,
       user: tunnel.users.name
     };

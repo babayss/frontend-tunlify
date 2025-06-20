@@ -11,7 +11,6 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { Textarea } from '@/components/ui/textarea';
 import Navbar from '@/components/Navbar';
 import { 
   Plus, 
@@ -50,8 +49,8 @@ interface Tunnel {
   subdomain: string;
   location: string;
   service_type: string;
-  local_port: number;
-  remote_port: number;
+  target_ip: string;
+  target_port: number;
   protocol: string;
   status: 'active' | 'inactive' | 'connecting';
   connection_token: string;
@@ -305,9 +304,9 @@ export default function DashboardPage() {
 
   const getClientCommand = (tunnel: Tunnel) => {
     if (tunnel.protocol === 'http') {
-      return `./tunlify-client -token=${tunnel.connection_token} -local=127.0.0.1:${tunnel.local_port}`;
+      return `./tunlify-client -token=${tunnel.connection_token} -local=127.0.0.1:${tunnel.local_port || tunnel.target_port}`;
     } else {
-      return `./tunlify-client -token=${tunnel.connection_token} -local=127.0.0.1:${tunnel.local_port} -protocol=${tunnel.protocol}`;
+      return `./tunlify-client -token=${tunnel.connection_token} -local=127.0.0.1:${tunnel.local_port || tunnel.target_port} -protocol=${tunnel.protocol}`;
     }
   };
 
@@ -719,7 +718,7 @@ export default function DashboardPage() {
                             <strong>{language === 'id' ? 'Layanan' : 'Service'}:</strong> {tunnel.service_info.name}
                           </p>
                           <p>
-                            <strong>{language === 'id' ? 'Port' : 'Port'}:</strong> {tunnel.local_port} → {tunnel.connection_info.port}
+                            <strong>{language === 'id' ? 'Target' : 'Target'}:</strong> {tunnel.target_ip}:{tunnel.target_port}
                           </p>
                           <p>
                             <strong>{t('location')}:</strong> {serverLocations.find(l => l.region_code === tunnel.location)?.name || tunnel.location}
@@ -799,7 +798,7 @@ export default function DashboardPage() {
                         <div><strong>Service:</strong> {selectedTunnel.service_info.name}</div>
                         <div><strong>URL:</strong> {selectedTunnel.tunnel_url}</div>
                         <div><strong>Protocol:</strong> {selectedTunnel.protocol.toUpperCase()}</div>
-                        <div><strong>Port Mapping:</strong> {selectedTunnel.local_port} → {selectedTunnel.connection_info.port}</div>
+                        <div><strong>Target:</strong> {selectedTunnel.target_ip}:{selectedTunnel.target_port}</div>
                       </div>
                     </AlertDescription>
                   </Alert>
@@ -908,8 +907,8 @@ export default function DashboardPage() {
                         </div>
                         <p className="text-xs text-muted-foreground mt-2">
                           {language === 'id' 
-                            ? `Ganti 127.0.0.1:${selectedTunnel.local_port} dengan alamat aplikasi lokal Anda.`
-                            : `Replace 127.0.0.1:${selectedTunnel.local_port} with your local application address.`
+                            ? `Ganti 127.0.0.1:${selectedTunnel.target_port} dengan alamat aplikasi lokal Anda.`
+                            : `Replace 127.0.0.1:${selectedTunnel.target_port} with your local application address.`
                           }
                         </p>
                       </div>
