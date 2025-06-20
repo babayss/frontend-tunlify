@@ -1,0 +1,36 @@
+{
+  "name": "tunlify-client",
+  "version": "1.0.0",
+  "description": "Tunlify tunneling client - Connect your local apps to the internet",
+  "main": "index.js",
+  "bin": {
+    "tunlify": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "build": "pkg . --out-path dist/",
+    "build-all": "pkg . --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --out-path dist/"
+  },
+  "keywords": ["tunnel", "ngrok", "proxy", "localhost"],
+  "author": "Tunlify",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "axios": "^1.6.2",
+    "commander": "^11.1.0",
+    "chalk": "^4.1.2",
+    "ora": "^5.4.1"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "scripts": "index.js",
+    "assets": [],
+    "targets": [
+      "node18-linux-x64",
+      "node18-win-x64",
+      "node18-macos-x64"
+    ]
+  }
+}
