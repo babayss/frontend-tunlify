@@ -3,93 +3,268 @@
 const { program } = require('commander');
 const axios = require('axios');
 const WebSocket = require('ws');
+const net = require('net');
+const dgram = require('dgram');
 const http = require('http');
 const https = require('https');
 const url = require('url');
 const chalk = require('chalk');
+const ora = require('ora');
 
 program
-  .requiredOption('-t, --token <token>', 'Tunnel token')
-  .requiredOption('-l, --local <url>', 'Local URL to expose, e.g. http://127.0.0.1:8000')
+  .requiredOption('-t, --token <token>', 'Tunnel connection token')
+  .requiredOption('-l, --local <address>', 'Local address to expose (e.g., 127.0.0.1:3000, localhost:22)')
+  .option('-p, --protocol <protocol>', 'Protocol type: http, tcp, udp', 'http')
   .option('-s, --server <url>', 'Tunlify server URL', 'https://api.tunlify.biz.id')
-  .option('--insecure', 'Allow self-signed HTTPS certificate', false)
+  .option('--insecure', 'Allow self-signed HTTPS certificates', false)
+  .option('--verbose', 'Enable verbose logging', false)
   .parse();
 
 const options = program.opts();
 
 class TunlifyClient {
-  constructor({ token, local, server, insecure }) {
+  constructor({ token, local, protocol, server, insecure, verbose }) {
     this.token = token;
     this.local = local;
+    this.protocol = protocol.toLowerCase();
     this.server = server;
     this.insecure = insecure;
+    this.verbose = verbose;
     this.ws = null;
+    this.tunnelInfo = null;
+    this.tcpConnections = new Map();
+    this.udpSockets = new Map();
+    this.spinner = null;
+    
+    // Parse local address
+    this.parseLocalAddress();
+  }
+
+  parseLocalAddress() {
+    // Support formats: 127.0.0.1:3000, localhost:22, :8080, 3000
+    let host = '127.0.0.1';
+    let port = 3000;
+
+    if (this.local.includes(':')) {
+      const parts = this.local.split(':');
+      if (parts[0]) host = parts[0];
+      port = parseInt(parts[1]);
+    } else {
+      port = parseInt(this.local);
+    }
+
+    this.localHost = host;
+    this.localPort = port;
+
+    if (isNaN(port) || port < 1 || port > 65535) {
+      console.error(chalk.red('❌ Invalid local port. Must be between 1-65535'));
+      process.exit(1);
+    }
+  }
+
+  log(message, level = 'info') {
+    if (!this.verbose && level === 'debug') return;
+    
+    const timestamp = new Date().toLocaleTimeString();
+    const prefix = level === 'error' ? chalk.red('❌') : 
+                   level === 'warn' ? chalk.yellow('⚠️') : 
+                   level === 'success' ? chalk.green('✅') : 
+                   chalk.blue('ℹ️');
+    
+    console.log(`${chalk.gray(timestamp)} ${prefix} ${message}`);
   }
 
   async start() {
-    const [status, error] = await this.testLocal();
-    if (!status) {
-      console.error(chalk.red(`❌ Local server not reachable: ${error}`));
+    this.spinner = ora('Connecting to Tunlify...').start();
+
+    try {
+      // Authenticate and get tunnel info
+      await this.authenticate();
+      
+      // Test local service
+      await this.testLocalService();
+      
+      // Connect WebSocket
+      await this.connectWebSocket();
+      
+      this.spinner.succeed('Connected successfully!');
+      this.displayTunnelInfo();
+      
+    } catch (error) {
+      this.spinner.fail(`Connection failed: ${error.message}`);
       process.exit(1);
     }
-
-    const wsUrl = this.server.replace(/^http/, 'ws') + `/ws/tunnel?token=${this.token}`;
-    this.ws = new WebSocket(wsUrl);
-
-    this.ws.on('open', () => {
-      console.log(chalk.green('✅ WebSocket connected'));
-    });
-
-    this.ws.on('message', async (data) => {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.type === 'request') {
-          this.forwardRequest(msg);
-        }
-      } catch (e) {
-        console.error(chalk.red('❌ Invalid message'), e.message);
-      }
-    });
-
-    this.ws.on('close', () => {
-      console.log(chalk.yellow('⚠️ Disconnected. Reconnecting in 5s...'));
-      setTimeout(() => this.start(), 5000);
-    });
-
-    this.ws.on('error', (err) => {
-      console.error(chalk.red('❌ WS error'), err.message);
-    });
-
-    setInterval(() => {
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'heartbeat' }));
-      }
-    }, 30000);
   }
 
-  async testLocal() {
+  async authenticate() {
     try {
-      const res = await axios.get(this.local, {
-        timeout: 3000,
+      const response = await axios.post(`${this.server}/api/tunnels/auth`, {
+        connection_token: this.token
+      }, {
+        timeout: 10000,
         httpsAgent: new https.Agent({ rejectUnauthorized: !this.insecure })
       });
-      console.log(chalk.gray(`✅ Local reachable: ${this.local} (${res.status})`));
-      return [true];
-    } catch (err) {
-      return [false, err.message];
+
+      this.tunnelInfo = response.data;
+      this.log(`Authenticated for tunnel: ${this.tunnelInfo.tunnel_url}`, 'success');
+      
+    } catch (error) {
+      if (error.response?.status === 401) {
+        throw new Error('Invalid connection token');
+      }
+      throw new Error(`Authentication failed: ${error.message}`);
     }
   }
 
-  async forwardRequest(msg) {
-    const { requestId, method, url: reqPath, headers, body } = msg;
+  async testLocalService() {
+    const testConnection = () => {
+      return new Promise((resolve, reject) => {
+        if (this.protocol === 'udp') {
+          // For UDP, we can't really test connectivity, so just resolve
+          resolve(true);
+          return;
+        }
 
-    const localUrl = new URL(reqPath, this.local);
-    const agent = localUrl.protocol === 'https:'
-      ? new https.Agent({ rejectUnauthorized: !this.insecure })
-      : undefined;
+        const socket = net.createConnection({
+          host: this.localHost,
+          port: this.localPort,
+          timeout: 3000
+        });
+
+        socket.on('connect', () => {
+          socket.destroy();
+          resolve(true);
+        });
+
+        socket.on('error', (err) => {
+          reject(err);
+        });
+
+        socket.on('timeout', () => {
+          socket.destroy();
+          reject(new Error('Connection timeout'));
+        });
+      });
+    };
 
     try {
-      const resp = await axios({
+      await testConnection();
+      this.log(`Local service reachable: ${this.localHost}:${this.localPort} (${this.protocol.toUpperCase()})`, 'success');
+    } catch (error) {
+      throw new Error(`Local service not reachable at ${this.localHost}:${this.localPort}: ${error.message}`);
+    }
+  }
+
+  async connectWebSocket() {
+    return new Promise((resolve, reject) => {
+      const wsUrl = this.server.replace(/^http/, 'ws') + `/ws/tunnel?token=${this.token}`;
+      this.ws = new WebSocket(wsUrl);
+
+      const timeout = setTimeout(() => {
+        reject(new Error('WebSocket connection timeout'));
+      }, 10000);
+
+      this.ws.on('open', () => {
+        clearTimeout(timeout);
+        this.log('WebSocket connected', 'success');
+        
+        // Send local address info
+        this.ws.send(JSON.stringify({
+          type: 'set_local_address',
+          address: `${this.localHost}:${this.localPort}`,
+          protocol: this.protocol
+        }));
+        
+        resolve();
+      });
+
+      this.ws.on('message', (data) => {
+        this.handleWebSocketMessage(data);
+      });
+
+      this.ws.on('close', (code, reason) => {
+        this.log(`WebSocket disconnected (${code}): ${reason}`, 'warn');
+        this.cleanup();
+        
+        // Reconnect after 5 seconds
+        setTimeout(() => {
+          this.log('Attempting to reconnect...', 'info');
+          this.connectWebSocket().catch(() => {
+            this.log('Reconnection failed, retrying in 10 seconds...', 'error');
+          });
+        }, 5000);
+      });
+
+      this.ws.on('error', (error) => {
+        clearTimeout(timeout);
+        this.log(`WebSocket error: ${error.message}`, 'error');
+        reject(error);
+      });
+    });
+  }
+
+  handleWebSocketMessage(data) {
+    try {
+      const message = JSON.parse(data);
+      
+      switch (message.type) {
+        case 'connected':
+          this.log('Tunnel established successfully', 'success');
+          break;
+          
+        case 'local_address_ack':
+          this.log(`Local address confirmed: ${message.address}`, 'debug');
+          break;
+          
+        case 'request':
+          if (this.protocol === 'http') {
+            this.handleHttpRequest(message);
+          } else {
+            this.handleTcpUdpRequest(message);
+          }
+          break;
+          
+        case 'tcp_connect':
+          this.handleTcpConnect(message);
+          break;
+          
+        case 'tcp_data':
+          this.handleTcpData(message);
+          break;
+          
+        case 'tcp_close':
+          this.handleTcpClose(message);
+          break;
+          
+        case 'udp_data':
+          this.handleUdpData(message);
+          break;
+          
+        case 'heartbeat':
+          this.ws.send(JSON.stringify({ type: 'heartbeat_ack' }));
+          break;
+          
+        default:
+          this.log(`Unknown message type: ${message.type}`, 'debug');
+      }
+    } catch (error) {
+      this.log(`Error parsing WebSocket message: ${error.message}`, 'error');
+    }
+  }
+
+  // HTTP Request Handler (existing functionality)
+  async handleHttpRequest(message) {
+    const { requestId, method, url: reqPath, headers, body } = message;
+    
+    this.log(`${method} ${reqPath}`, 'debug');
+
+    try {
+      const localUrl = new URL(reqPath, `http://${this.localHost}:${this.localPort}`);
+      const agent = localUrl.protocol === 'https:'
+        ? new https.Agent({ rejectUnauthorized: !this.insecure })
+        : undefined;
+
+      const response = await axios({
         method,
         url: localUrl.toString(),
         headers: this.sanitizeHeaders(headers),
@@ -100,46 +275,301 @@ class TunlifyClient {
         validateStatus: () => true
       });
 
-      const contentType = resp.headers['content-type'] || '';
-      const isBinary = /image|video|audio|application\/octet-stream/.test(contentType);
+      const contentType = response.headers['content-type'] || '';
+      const isBinary = /image|video|audio|application\/octet-stream|application\/pdf/.test(contentType);
       const encoding = isBinary ? 'base64' : 'utf8';
 
       const responsePayload = {
         type: 'response',
         requestId,
-        statusCode: resp.status,
-        headers: resp.headers,
+        statusCode: response.status,
+        headers: response.headers,
         encoding,
         body: encoding === 'base64'
-          ? Buffer.from(resp.data).toString('base64')
-          : resp.data.toString()
+          ? Buffer.from(response.data).toString('base64')
+          : response.data.toString()
       };
 
       this.ws.send(JSON.stringify(responsePayload));
-    } catch (err) {
+      
+    } catch (error) {
+      this.log(`HTTP request error: ${error.message}`, 'error');
       this.ws.send(JSON.stringify({
         type: 'error',
         requestId,
-        message: err.message
+        message: error.message
       }));
-      console.error(chalk.red(`❌ Request error ${reqPath}: ${err.message}`));
     }
   }
 
+  // TCP Connection Handler
+  handleTcpConnect(message) {
+    const { connectionId } = message;
+    
+    this.log(`New TCP connection: ${connectionId}`, 'debug');
+
+    const socket = net.createConnection({
+      host: this.localHost,
+      port: this.localPort
+    });
+
+    socket.on('connect', () => {
+      this.log(`TCP connected to local service: ${connectionId}`, 'debug');
+      this.tcpConnections.set(connectionId, socket);
+      
+      this.ws.send(JSON.stringify({
+        type: 'tcp_connect_ack',
+        connectionId
+      }));
+    });
+
+    socket.on('data', (data) => {
+      this.ws.send(JSON.stringify({
+        type: 'tcp_data',
+        connectionId,
+        data: data.toString('base64')
+      }));
+    });
+
+    socket.on('close', () => {
+      this.log(`TCP connection closed: ${connectionId}`, 'debug');
+      this.tcpConnections.delete(connectionId);
+      
+      this.ws.send(JSON.stringify({
+        type: 'tcp_close',
+        connectionId
+      }));
+    });
+
+    socket.on('error', (error) => {
+      this.log(`TCP connection error ${connectionId}: ${error.message}`, 'error');
+      this.tcpConnections.delete(connectionId);
+      
+      this.ws.send(JSON.stringify({
+        type: 'tcp_error',
+        connectionId,
+        error: error.message
+      }));
+    });
+  }
+
+  // TCP Data Handler
+  handleTcpData(message) {
+    const { connectionId, data } = message;
+    const socket = this.tcpConnections.get(connectionId);
+    
+    if (socket && !socket.destroyed) {
+      const buffer = Buffer.from(data, 'base64');
+      socket.write(buffer);
+    }
+  }
+
+  // TCP Close Handler
+  handleTcpClose(message) {
+    const { connectionId } = message;
+    const socket = this.tcpConnections.get(connectionId);
+    
+    if (socket && !socket.destroyed) {
+      socket.destroy();
+      this.tcpConnections.delete(connectionId);
+    }
+  }
+
+  // UDP Data Handler
+  handleUdpData(message) {
+    const { sessionId, data, remoteAddress, remotePort } = message;
+    
+    this.log(`UDP data from ${remoteAddress}:${remotePort}`, 'debug');
+
+    const buffer = Buffer.from(data, 'base64');
+    
+    // Create UDP socket if not exists
+    if (!this.udpSockets.has(sessionId)) {
+      const socket = dgram.createSocket('udp4');
+      this.udpSockets.set(sessionId, socket);
+      
+      socket.on('message', (msg, rinfo) => {
+        this.ws.send(JSON.stringify({
+          type: 'udp_response',
+          sessionId,
+          data: msg.toString('base64'),
+          localAddress: rinfo.address,
+          localPort: rinfo.port
+        }));
+      });
+      
+      socket.on('error', (error) => {
+        this.log(`UDP socket error: ${error.message}`, 'error');
+        this.udpSockets.delete(sessionId);
+      });
+    }
+
+    const socket = this.udpSockets.get(sessionId);
+    socket.send(buffer, this.localPort, this.localHost);
+  }
+
+  // Handle TCP/UDP requests (placeholder for future implementation)
+  handleTcpUdpRequest(message) {
+    // This will be implemented when the backend supports direct TCP/UDP proxying
+    this.log(`TCP/UDP request handling not yet implemented: ${message.type}`, 'warn');
+  }
+
   sanitizeHeaders(headers) {
-    const skip = new Set([
+    const skipHeaders = new Set([
       'host', 'connection', 'upgrade', 'x-forwarded-for',
       'x-real-ip', 'x-tunnel-subdomain', 'x-tunnel-region',
-      'x-forwarded-host', 'x-forwarded-proto'
+      'x-forwarded-host', 'x-forwarded-proto', 'content-length',
+      'transfer-encoding'
     ]);
+    
     const result = {};
-    for (const key in headers) {
-      if (!skip.has(key.toLowerCase())) {
-        result[key] = headers[key];
+    for (const [key, value] of Object.entries(headers || {})) {
+      if (!skipHeaders.has(key.toLowerCase()) && value !== undefined) {
+        result[key] = value;
       }
     }
     return result;
   }
+
+  displayTunnelInfo() {
+    console.log('\n' + chalk.green('🚀 Tunnel Active!'));
+    console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+    
+    console.log(chalk.bold('📋 Tunnel Information:'));
+    console.log(`   Service: ${chalk.yellow(this.tunnelInfo.service_name || 'Custom')}`);
+    console.log(`   Protocol: ${chalk.yellow(this.protocol.toUpperCase())}`);
+    console.log(`   Local: ${chalk.yellow(`${this.localHost}:${this.localPort}`)}`);
+    console.log(`   Remote: ${chalk.yellow(this.tunnelInfo.tunnel_url)}`);
+    
+    if (this.tunnelInfo.remote_port && this.protocol !== 'http') {
+      console.log(`   Remote Port: ${chalk.yellow(this.tunnelInfo.remote_port)}`);
+    }
+    
+    console.log('\n' + chalk.bold('🔗 Connection Examples:'));
+    this.displayConnectionExamples();
+    
+    console.log('\n' + chalk.gray('Press Ctrl+C to stop the tunnel'));
+    console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+  }
+
+  displayConnectionExamples() {
+    const { service_type, tunnel_url, remote_port } = this.tunnelInfo;
+    const host = tunnel_url.replace(/^https?:\/\//, '').split(':')[0];
+    
+    switch (service_type) {
+      case 'ssh':
+        console.log(`   SSH: ${chalk.green(`ssh username@${host} -p ${remote_port}`)}`);
+        console.log(`   SCP: ${chalk.green(`scp -P ${remote_port} file.txt username@${host}:/path/`)}`);
+        break;
+        
+      case 'rdp':
+        console.log(`   Windows: ${chalk.green(`mstsc /v:${host}:${remote_port}`)}`);
+        console.log(`   Linux: ${chalk.green(`xfreerdp /v:${host}:${remote_port} /u:username`)}`);
+        break;
+        
+      case 'mysql':
+        console.log(`   MySQL CLI: ${chalk.green(`mysql -h ${host} -P ${remote_port} -u username -p`)}`);
+        console.log(`   Connection String: ${chalk.green(`mysql://username:password@${host}:${remote_port}/database`)}`);
+        break;
+        
+      case 'postgresql':
+        console.log(`   psql: ${chalk.green(`psql -h ${host} -p ${remote_port} -U username -d database`)}`);
+        console.log(`   Connection String: ${chalk.green(`postgresql://username:password@${host}:${remote_port}/database`)}`);
+        break;
+        
+      case 'mongodb':
+        console.log(`   Mongo CLI: ${chalk.green(`mongo mongodb://${host}:${remote_port}/database`)}`);
+        console.log(`   Connection String: ${chalk.green(`mongodb://username:password@${host}:${remote_port}/database`)}`);
+        break;
+        
+      case 'redis':
+        console.log(`   Redis CLI: ${chalk.green(`redis-cli -h ${host} -p ${remote_port}`)}`);
+        break;
+        
+      case 'vnc':
+        console.log(`   VNC Viewer: ${chalk.green(`${host}:${remote_port}`)}`);
+        break;
+        
+      case 'ftp':
+        console.log(`   FTP: ${chalk.green(`ftp ${host} ${remote_port}`)}`);
+        break;
+        
+      case 'minecraft':
+        console.log(`   Minecraft: ${chalk.green(`${host}:${remote_port}`)}`);
+        break;
+        
+      case 'http':
+      case 'https':
+        console.log(`   Browser: ${chalk.green(tunnel_url)}`);
+        console.log(`   cURL: ${chalk.green(`curl ${tunnel_url}`)}`);
+        break;
+        
+      default:
+        if (this.protocol === 'tcp') {
+          console.log(`   TCP: ${chalk.green(`telnet ${host} ${remote_port}`)}`);
+        } else if (this.protocol === 'udp') {
+          console.log(`   UDP: ${chalk.green(`nc -u ${host} ${remote_port}`)}`);
+        }
+    }
+  }
+
+  cleanup() {
+    // Close all TCP connections
+    for (const [connectionId, socket] of this.tcpConnections) {
+      if (!socket.destroyed) {
+        socket.destroy();
+      }
+    }
+    this.tcpConnections.clear();
+
+    // Close all UDP sockets
+    for (const [sessionId, socket] of this.udpSockets) {
+      socket.close();
+    }
+    this.udpSockets.clear();
+  }
+
+  // Graceful shutdown
+  shutdown() {
+    this.log('Shutting down tunnel...', 'info');
+    
+    if (this.spinner && this.spinner.isSpinning) {
+      this.spinner.stop();
+    }
+    
+    this.cleanup();
+    
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.close();
+    }
+    
+    process.exit(0);
+  }
 }
 
-new TunlifyClient(options).start();
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n' + chalk.yellow('🛑 Received interrupt signal'));
+  if (global.client) {
+    global.client.shutdown();
+  } else {
+    process.exit(0);
+  }
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n' + chalk.yellow('🛑 Received terminate signal'));
+  if (global.client) {
+    global.client.shutdown();
+  } else {
+    process.exit(0);
+  }
+});
+
+// Start the client
+const client = new TunlifyClient(options);
+global.client = client;
+client.start().catch((error) => {
+  console.error(chalk.red(`❌ Failed to start client: ${error.message}`));
+  process.exit(1);
+});

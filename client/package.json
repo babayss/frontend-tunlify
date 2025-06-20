@@ -1,18 +1,35 @@
 {
   "name": "tunlify-client",
-  "version": "1.0.0",
-  "description": "Tunlify tunneling client - Connect your local apps to the internet",
+  "version": "2.0.0",
+  "description": "Tunlify tunneling client - Connect your local apps to the internet (HTTP, TCP, UDP)",
   "main": "index.js",
   "bin": {
-    "tunlify": "./index.js"
+    "tunlify": "./index.js",
+    "tunlify-client": "./index.js"
   },
   "scripts": {
     "start": "node index.js",
+    "dev": "node index.js",
     "build": "pkg . --out-path dist/",
-    "build-all": "pkg . --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --out-path dist/"
+    "build-all": "pkg . --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --out-path dist/",
+    "build-linux": "pkg . --targets node18-linux-x64 --out-path dist/ --output tunlify-client-linux",
+    "build-windows": "pkg . --targets node18-win-x64 --out-path dist/ --output tunlify-client-windows.exe",
+    "build-macos": "pkg . --targets node18-macos-x64 --out-path dist/ --output tunlify-client-macos",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["tunnel", "ngrok", "proxy", "localhost"],
-  "author": "Tunlify",
+  "keywords": [
+    "tunnel", 
+    "ngrok", 
+    "proxy", 
+    "localhost", 
+    "tcp", 
+    "udp", 
+    "ssh", 
+    "rdp", 
+    "database",
+    "port-forwarding"
+  ],
+  "author": "Tunlify Team",
   "license": "MIT",
   "dependencies": {
     "ws": "^8.14.2",
@@ -31,6 +48,18 @@
       "node18-linux-x64",
       "node18-win-x64",
       "node18-macos-x64"
-    ]
-  }
+    ],
+    "outputPath": "dist"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tunlify/client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tunlify/client/issues"
+  },
+  "homepage": "https://tunlify.biz.id"
 }
