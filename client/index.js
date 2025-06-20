@@ -13,7 +13,7 @@ const ora = require('ora');
 
 program
   .requiredOption('-t, --token <token>', 'Tunnel connection token')
-  .requiredOption('-l, --local <address>', 'Local address to expose (e.g., 127.0.0.1:3000, localhost:22)')
+  .requiredOption('-l, --local <address>', 'Local address to expose (e.g., 127.0.0.1:3000, localhost:22, https://10.1.1.124:8000)')
   .option('-p, --protocol <protocol>', 'Protocol type: http, tcp, udp', 'http')
   .option('-s, --server <url>', 'Tunlify server URL', 'https://api.tunlify.biz.id')
   .option('--insecure', 'Allow self-signed HTTPS certificates', false)
@@ -41,23 +41,55 @@ class TunlifyClient {
   }
 
   parseLocalAddress() {
-    // Support formats: 127.0.0.1:3000, localhost:22, :8080, 3000
     let host = '127.0.0.1';
     let port = 3000;
+    let isHttps = false;
 
-    if (this.local.includes(':')) {
-      const parts = this.local.split(':');
-      if (parts[0]) host = parts[0];
-      port = parseInt(parts[1]);
-    } else {
-      port = parseInt(this.local);
-    }
+    try {
+      // Check if it's a full URL (http:// or https://)
+      if (this.local.startsWith('http://') || this.local.startsWith('https://')) {
+        const parsedUrl = new URL(this.local);
+        host = parsedUrl.hostname;
+        port = parseInt(parsedUrl.port) || (parsedUrl.protocol === 'https:' ? 443 : 80);
+        isHttps = parsedUrl.protocol === 'https:';
+        
+        this.log(`Parsed URL: ${this.local} -> ${host}:${port} (HTTPS: ${isHttps})`, 'debug');
+      }
+      // Check if it contains a colon (host:port format)
+      else if (this.local.includes(':')) {
+        const parts = this.local.split(':');
+        if (parts[0]) host = parts[0];
+        port = parseInt(parts[1]);
+      }
+      // Just a port number
+      else if (/^\d+$/.test(this.local)) {
+        port = parseInt(this.local);
+      }
+      // Invalid format
+      else {
+        throw new Error(`Invalid local address format: ${this.local}`);
+      }
 
-    this.localHost = host;
-    this.localPort = port;
+      // Validate port
+      if (isNaN(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid port number: ${port}. Must be between 1-65535`);
+      }
 
-    if (isNaN(port) || port < 1 || port > 65535) {
-      console.error(chalk.red('❌ Invalid local port. Must be between 1-65535'));
+      this.localHost = host;
+      this.localPort = port;
+      this.isHttps = isHttps;
+
+      this.log(`Local address parsed: ${host}:${port} (HTTPS: ${isHttps})`, 'debug');
+
+    } catch (error) {
+      console.error(chalk.red(`❌ Error parsing local address: ${error.message}`));
+      console.error(chalk.yellow('💡 Supported formats:'));
+      console.error(chalk.yellow('   - 127.0.0.1:3000'));
+      console.error(chalk.yellow('   - localhost:22'));
+      console.error(chalk.yellow('   - :8080'));
+      console.error(chalk.yellow('   - 3000'));
+      console.error(chalk.yellow('   - http://10.1.1.124:8000'));
+      console.error(chalk.yellow('   - https://10.1.1.124:8000'));
       process.exit(1);
     }
   }
@@ -125,6 +157,35 @@ class TunlifyClient {
           return;
         }
 
+        // For HTTP protocol, test with HTTP request
+        if (this.protocol === 'http') {
+          const testUrl = `${this.isHttps ? 'https' : 'http'}://${this.localHost}:${this.localPort}`;
+          
+          const agent = this.isHttps 
+            ? new https.Agent({ rejectUnauthorized: !this.insecure })
+            : undefined;
+
+          axios.get(testUrl, {
+            timeout: 3000,
+            httpsAgent: agent,
+            validateStatus: () => true // Accept any status code
+          })
+          .then(() => resolve(true))
+          .catch((error) => {
+            if (error.code === 'ECONNREFUSED') {
+              reject(new Error('Connection refused - service not running'));
+            } else if (error.code === 'ENOTFOUND') {
+              reject(new Error('Host not found'));
+            } else {
+              // For HTTP, even errors like 404 mean the service is responding
+              resolve(true);
+            }
+          });
+          
+          return;
+        }
+
+        // For TCP, test with socket connection
         const socket = net.createConnection({
           host: this.localHost,
           port: this.localPort,
@@ -149,9 +210,18 @@ class TunlifyClient {
 
     try {
       await testConnection();
-      this.log(`Local service reachable: ${this.localHost}:${this.localPort} (${this.protocol.toUpperCase()})`, 'success');
+      const serviceType = this.protocol === 'http' ? 'HTTP service' : `${this.protocol.toUpperCase()} service`;
+      const serviceUrl = this.protocol === 'http' 
+        ? `${this.isHttps ? 'https' : 'http'}://${this.localHost}:${this.localPort}`
+        : `${this.localHost}:${this.localPort}`;
+      
+      this.log(`${serviceType} reachable: ${serviceUrl}`, 'success');
     } catch (error) {
-      throw new Error(`Local service not reachable at ${this.localHost}:${this.localPort}: ${error.message}`);
+      const serviceUrl = this.protocol === 'http' 
+        ? `${this.isHttps ? 'https' : 'http'}://${this.localHost}:${this.localPort}`
+        : `${this.localHost}:${this.localPort}`;
+        
+      throw new Error(`Local service not reachable at ${serviceUrl}: ${error.message}`);
     }
   }
 
@@ -169,10 +239,15 @@ class TunlifyClient {
         this.log('WebSocket connected', 'success');
         
         // Send local address info
+        const localAddress = this.protocol === 'http' && this.isHttps
+          ? `https://${this.localHost}:${this.localPort}`
+          : `${this.localHost}:${this.localPort}`;
+          
         this.ws.send(JSON.stringify({
           type: 'set_local_address',
-          address: `${this.localHost}:${this.localPort}`,
-          protocol: this.protocol
+          address: localAddress,
+          protocol: this.protocol,
+          https: this.isHttps
         }));
         
         resolve();
@@ -252,15 +327,18 @@ class TunlifyClient {
     }
   }
 
-  // HTTP Request Handler (existing functionality)
+  // HTTP Request Handler (enhanced for HTTPS support)
   async handleHttpRequest(message) {
     const { requestId, method, url: reqPath, headers, body } = message;
     
     this.log(`${method} ${reqPath}`, 'debug');
 
     try {
-      const localUrl = new URL(reqPath, `http://${this.localHost}:${this.localPort}`);
-      const agent = localUrl.protocol === 'https:'
+      // Build the local URL with proper protocol
+      const protocol = this.isHttps ? 'https' : 'http';
+      const localUrl = new URL(reqPath, `${protocol}://${this.localHost}:${this.localPort}`);
+      
+      const agent = this.isHttps
         ? new https.Agent({ rejectUnauthorized: !this.insecure })
         : undefined;
 
@@ -438,7 +516,11 @@ class TunlifyClient {
     console.log(chalk.bold('📋 Tunnel Information:'));
     console.log(`   Service: ${chalk.yellow(this.tunnelInfo.service_name || 'Custom')}`);
     console.log(`   Protocol: ${chalk.yellow(this.protocol.toUpperCase())}`);
-    console.log(`   Local: ${chalk.yellow(`${this.localHost}:${this.localPort}`)}`);
+    
+    const localUrl = this.protocol === 'http' && this.isHttps
+      ? `https://${this.localHost}:${this.localPort}`
+      : `${this.localHost}:${this.localPort}`;
+    console.log(`   Local: ${chalk.yellow(localUrl)}`);
     console.log(`   Remote: ${chalk.yellow(this.tunnelInfo.tunnel_url)}`);
     
     if (this.tunnelInfo.remote_port && this.protocol !== 'http') {
@@ -502,6 +584,9 @@ class TunlifyClient {
       case 'https':
         console.log(`   Browser: ${chalk.green(tunnel_url)}`);
         console.log(`   cURL: ${chalk.green(`curl ${tunnel_url}`)}`);
+        if (this.isHttps) {
+          console.log(`   Local HTTPS: ${chalk.yellow(`https://${this.localHost}:${this.localPort}`)}`);
+        }
         break;
         
       default:

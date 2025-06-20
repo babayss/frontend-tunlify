@@ -5,6 +5,8 @@ Advanced tunneling client that supports HTTP, TCP, and UDP protocols for exposin
 ## 🚀 Features
 
 - **Multi-Protocol Support**: HTTP/HTTPS, TCP, UDP
+- **Flexible Address Formats**: Support for URLs, IP addresses, and port numbers
+- **HTTPS Support**: Native support for local HTTPS services
 - **Service Presets**: SSH, RDP, MySQL, PostgreSQL, MongoDB, Redis, VNC, FTP, Mail servers, and more
 - **Auto-Reconnection**: Automatic reconnection on connection loss
 - **Real-time Monitoring**: Connection status and traffic monitoring
@@ -32,14 +34,41 @@ npm run build-all
 
 ## 🔧 Usage
 
+### Supported Address Formats
+
+The client supports multiple address formats for maximum flexibility:
+
+```bash
+# IP address with port
+./tunlify-client -t TOKEN -l 127.0.0.1:3000
+
+# Hostname with port
+./tunlify-client -t TOKEN -l localhost:22
+
+# Port only (defaults to 127.0.0.1)
+./tunlify-client -t TOKEN -l 3000
+
+# Port with colon prefix
+./tunlify-client -t TOKEN -l :8080
+
+# Full HTTP URL
+./tunlify-client -t TOKEN -l http://10.1.1.124:8000
+
+# Full HTTPS URL (for local HTTPS services)
+./tunlify-client -t TOKEN -l https://10.1.1.124:8000
+```
+
 ### Basic HTTP Tunneling
 
 ```bash
 # Expose local web server
 ./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:3000
 
-# Expose with specific protocol
-./tunlify-client -t YOUR_TOKEN -l localhost:8080 -p http
+# Expose HTTPS service
+./tunlify-client -t YOUR_TOKEN -l https://localhost:8443
+
+# Expose service on different host
+./tunlify-client -t YOUR_TOKEN -l http://10.1.1.124:8000
 ```
 
 ### SSH Tunneling
@@ -78,24 +107,17 @@ ssh username@yourapp.id.tunlify.biz.id -p 12345
 mstsc /v:yourapp.id.tunlify.biz.id:12345
 ```
 
-### VNC Server
+### HTTPS Services
 
 ```bash
-# Expose VNC server
-./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:5900 -p tcp
+# Local HTTPS development server
+./tunlify-client -t YOUR_TOKEN -l https://localhost:8443
 
-# Connect with VNC viewer
-vncviewer yourapp.id.tunlify.biz.id:12345
-```
+# HTTPS service on different host
+./tunlify-client -t YOUR_TOKEN -l https://10.1.1.124:8000
 
-### Game Servers
-
-```bash
-# Minecraft server
-./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:25565 -p tcp
-
-# Connect in Minecraft
-# Server Address: yourapp.id.tunlify.biz.id:12345
+# With insecure flag for self-signed certificates
+./tunlify-client -t YOUR_TOKEN -l https://localhost:8443 --insecure
 ```
 
 ### UDP Services
@@ -114,7 +136,8 @@ nc -u yourapp.id.tunlify.biz.id 12345
 Options:
   -t, --token <token>      Tunnel connection token (required)
   -l, --local <address>    Local address to expose (required)
-                          Examples: 127.0.0.1:3000, localhost:22, :8080, 3000
+                          Formats: 127.0.0.1:3000, localhost:22, :8080, 3000,
+                                  http://10.1.1.124:8000, https://localhost:8443
   -p, --protocol <type>    Protocol type: http, tcp, udp (default: "http")
   -s, --server <url>       Tunlify server URL (default: "https://api.tunlify.biz.id")
   --insecure              Allow self-signed HTTPS certificates
@@ -161,19 +184,21 @@ export TUNLIFY_VERBOSE="false"
 ./tunlify-client -l 127.0.0.1:3000
 ```
 
-### Configuration File
+### HTTPS Development
 
-Create `tunlify.config.json`:
+For local HTTPS development servers:
 
-```json
-{
-  "token": "your_token_here",
-  "local": "127.0.0.1:3000",
-  "protocol": "http",
-  "server": "https://api.tunlify.biz.id",
-  "insecure": false,
-  "verbose": false
-}
+```bash
+# Next.js with HTTPS
+npm run dev -- --experimental-https
+./tunlify-client -t TOKEN -l https://localhost:3000 --insecure
+
+# Express with HTTPS
+node https-server.js  # Your HTTPS server on port 8443
+./tunlify-client -t TOKEN -l https://localhost:8443 --insecure
+
+# Apache/Nginx with HTTPS
+./tunlify-client -t TOKEN -l https://localhost:443 --insecure
 ```
 
 ## 🐛 Troubleshooting
@@ -182,29 +207,47 @@ Create `tunlify.config.json`:
 
 ```bash
 # Test with verbose logging
-./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:3000 --verbose
+./tunlify-client -t YOUR_TOKEN -l https://10.1.1.124:8000 --verbose
 
 # Test local service first
-curl http://127.0.0.1:3000
-telnet 127.0.0.1 22
+curl https://10.1.1.124:8000
+curl -k https://10.1.1.124:8000  # For self-signed certificates
 ```
 
 ### Common Errors
 
-1. **"Local service not reachable"**
+1. **"Invalid local address format"**
+   - Check your address format
+   - Supported: `127.0.0.1:3000`, `https://10.1.1.124:8000`, `:8080`, `3000`
+
+2. **"Local service not reachable"**
    - Ensure your local service is running
    - Check the port number is correct
-   - Verify firewall settings
+   - For HTTPS, verify SSL certificate
+   - Use `--insecure` flag for self-signed certificates
 
-2. **"Invalid connection token"**
+3. **"Invalid connection token"**
    - Check your token is correct
    - Ensure the tunnel exists in dashboard
    - Token might have expired
 
-3. **"WebSocket connection failed"**
+4. **"WebSocket connection failed"**
    - Check internet connection
    - Verify server URL is correct
    - Try with `--insecure` flag for testing
+
+### HTTPS Troubleshooting
+
+```bash
+# Test HTTPS service locally
+curl -k https://localhost:8443
+
+# Check certificate
+openssl s_client -connect localhost:8443
+
+# Use insecure flag for self-signed certificates
+./tunlify-client -t TOKEN -l https://localhost:8443 --insecure
+```
 
 ## 📊 Monitoring
 
@@ -215,6 +258,7 @@ The client provides real-time information about:
 - Data transfer
 - Error messages
 - Reconnection attempts
+- HTTPS certificate validation
 
 ## 🔒 Security
 
@@ -222,26 +266,9 @@ The client provides real-time information about:
 - Tokens are unique per tunnel
 - No data is stored on Tunlify servers
 - Local services remain on your machine
+- HTTPS services maintain their encryption
 
-## 📝 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 📞 Support
-
-- Documentation: [https://docs.tunlify.biz.id](https://docs.tunlify.biz.id)
-- Issues: [GitHub Issues](https://github.com/tunlify/client/issues)
-- Email: support@tunlify.biz.id
-
-## 🎯 Examples
+## 📝 Examples
 
 ### Development Workflow
 
@@ -253,6 +280,19 @@ npm run dev  # Usually runs on port 3000
 ./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:3000
 
 # Share the public URL with team members
+# https://myapp.id.tunlify.biz.id
+```
+
+### HTTPS Development
+
+```bash
+# Start HTTPS development server
+npm run dev:https  # Runs on https://localhost:3000
+
+# Start tunnel with HTTPS support
+./tunlify-client -t YOUR_TOKEN -l https://localhost:3000 --insecure
+
+# Access via public URL (automatically HTTPS)
 # https://myapp.id.tunlify.biz.id
 ```
 
@@ -276,4 +316,14 @@ ssh admin@myapp.id.tunlify.biz.id -p 12345
 # RDP access
 ./tunlify-client -t YOUR_TOKEN -l 127.0.0.1:3389 -p tcp
 mstsc /v:myapp.id.tunlify.biz.id:12345
+```
+
+### Internal Network Services
+
+```bash
+# Expose service on internal network
+./tunlify-client -t YOUR_TOKEN -l 192.168.1.100:8080
+
+# Expose HTTPS service on internal network
+./tunlify-client -t YOUR_TOKEN -l https://192.168.1.100:8443 --insecure
 ```
