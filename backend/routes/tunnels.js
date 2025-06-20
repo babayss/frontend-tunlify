@@ -6,14 +6,34 @@ const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Get user tunnels
+// Predefined port configurations for common services
+const PORT_PRESETS = {
+  ssh: { port: 22, name: 'SSH Server', protocol: 'tcp', description: 'Secure Shell remote access' },
+  rdp: { port: 3389, name: 'Remote Desktop', protocol: 'tcp', description: 'Windows Remote Desktop Protocol' },
+  ftp: { port: 21, name: 'FTP Server', protocol: 'tcp', description: 'File Transfer Protocol' },
+  smtp: { port: 25, name: 'SMTP Mail', protocol: 'tcp', description: 'Simple Mail Transfer Protocol' },
+  pop3: { port: 110, name: 'POP3 Mail', protocol: 'tcp', description: 'Post Office Protocol v3' },
+  imap: { port: 143, name: 'IMAP Mail', protocol: 'tcp', description: 'Internet Message Access Protocol' },
+  mysql: { port: 3306, name: 'MySQL Database', protocol: 'tcp', description: 'MySQL Database Server' },
+  postgresql: { port: 5432, name: 'PostgreSQL', protocol: 'tcp', description: 'PostgreSQL Database Server' },
+  mongodb: { port: 27017, name: 'MongoDB', protocol: 'tcp', description: 'MongoDB Database Server' },
+  redis: { port: 6379, name: 'Redis Cache', protocol: 'tcp', description: 'Redis In-Memory Database' },
+  vnc: { port: 5900, name: 'VNC Server', protocol: 'tcp', description: 'Virtual Network Computing' },
+  teamviewer: { port: 5938, name: 'TeamViewer', protocol: 'tcp', description: 'TeamViewer Remote Access' },
+  minecraft: { port: 25565, name: 'Minecraft Server', protocol: 'tcp', description: 'Minecraft Game Server' },
+  http: { port: 80, name: 'HTTP Server', protocol: 'http', description: 'Web Server (HTTP)' },
+  https: { port: 443, name: 'HTTPS Server', protocol: 'http', description: 'Secure Web Server (HTTPS)' },
+  custom: { port: null, name: 'Custom Port', protocol: 'tcp', description: 'Custom TCP/UDP port' }
+};
+
+// Get user tunnels with enhanced port information
 router.get('/', authenticateToken, async (req, res) => {
   try {
     const { data: tunnels, error } = await supabase
       .from('tunnels')
       .select(`
         *,
-        server_locations!tunnels_location_fkey(name)
+        server_locations!tunnels_location_fkey(name, ip_address)
       `)
       .eq('user_id', req.user.id)
       .order('created_at', { ascending: false });
@@ -23,11 +43,28 @@ router.get('/', authenticateToken, async (req, res) => {
       return res.status(500).json({ message: 'Failed to fetch tunnels' });
     }
 
-    // Format response
-    const formattedTunnels = tunnels.map(tunnel => ({
-      ...tunnel,
-      location_name: tunnel.server_locations?.name || tunnel.location
-    }));
+    // Format response with port information
+    const formattedTunnels = tunnels.map(tunnel => {
+      const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
+      return {
+        ...tunnel,
+        location_name: tunnel.server_locations?.name || tunnel.location,
+        server_ip: tunnel.server_locations?.ip_address,
+        service_info: {
+          name: preset.name,
+          description: preset.description,
+          protocol: tunnel.protocol || preset.protocol
+        },
+        tunnel_url: tunnel.protocol === 'http' 
+          ? `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`
+          : `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port || tunnel.local_port}`,
+        connection_info: {
+          host: `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`,
+          port: tunnel.remote_port || tunnel.local_port,
+          protocol: tunnel.protocol || 'tcp'
+        }
+      };
+    });
 
     res.json(formattedTunnels);
   } catch (error) {
@@ -36,7 +73,12 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-// Create tunnel (ngrok-style) - FIXED: Remove target_ip and target_port requirements
+// Get available port presets
+router.get('/presets', (req, res) => {
+  res.json(PORT_PRESETS);
+});
+
+// Create tunnel with port support
 router.post('/', authenticateToken, [
   body('subdomain')
     .trim()
@@ -46,7 +88,21 @@ router.post('/', authenticateToken, [
   body('location')
     .trim()
     .isLength({ min: 2, max: 10 })
-    .withMessage('Location must be 2-10 characters')
+    .withMessage('Location must be 2-10 characters'),
+  body('service_type')
+    .isIn(Object.keys(PORT_PRESETS))
+    .withMessage('Invalid service type'),
+  body('local_port')
+    .isInt({ min: 1, max: 65535 })
+    .withMessage('Local port must be between 1-65535'),
+  body('remote_port')
+    .optional()
+    .isInt({ min: 1, max: 65535 })
+    .withMessage('Remote port must be between 1-65535'),
+  body('protocol')
+    .optional()
+    .isIn(['tcp', 'udp', 'http'])
+    .withMessage('Protocol must be tcp, udp, or http')
 ], async (req, res) => {
   try {
     console.log('🔍 Create tunnel request:', req.body);
@@ -60,9 +116,10 @@ router.post('/', authenticateToken, [
       });
     }
 
-    const { subdomain, location } = req.body;
+    const { subdomain, location, service_type, local_port, remote_port, protocol } = req.body;
+    const preset = PORT_PRESETS[service_type];
 
-    console.log(`🔍 Creating tunnel: ${subdomain}.${location} for user ${req.user.id}`);
+    console.log(`🔍 Creating ${service_type} tunnel: ${subdomain}.${location} for user ${req.user.id}`);
 
     // Check if subdomain is already taken in this location
     const { data: existingTunnel } = await supabase
@@ -82,7 +139,7 @@ router.post('/', authenticateToken, [
     // Check if location exists
     const { data: locationData, error: locationError } = await supabase
       .from('server_locations')
-      .select('id, name')
+      .select('id, name, ip_address')
       .eq('region_code', location)
       .single();
 
@@ -91,21 +148,57 @@ router.post('/', authenticateToken, [
       return res.status(400).json({ message: 'Invalid server location' });
     }
 
+    // For TCP/UDP services, assign a unique remote port if not specified
+    let finalRemotePort = remote_port;
+    if (!finalRemotePort && (protocol === 'tcp' || protocol === 'udp' || service_type !== 'http')) {
+      // Generate a random port in the range 10000-60000
+      finalRemotePort = Math.floor(Math.random() * 50000) + 10000;
+      
+      // Check if port is already in use
+      const { data: existingPort } = await supabase
+        .from('tunnels')
+        .select('id')
+        .eq('location', location)
+        .eq('remote_port', finalRemotePort)
+        .single();
+
+      if (existingPort) {
+        // Try a few more times
+        for (let i = 0; i < 5; i++) {
+          finalRemotePort = Math.floor(Math.random() * 50000) + 10000;
+          const { data: checkPort } = await supabase
+            .from('tunnels')
+            .select('id')
+            .eq('location', location)
+            .eq('remote_port', finalRemotePort)
+            .single();
+          
+          if (!checkPort) break;
+        }
+      }
+    }
+
     // Generate unique connection token
     const connectionToken = crypto.randomBytes(32).toString('hex');
     console.log(`🔑 Generated connection token: ${connectionToken.substring(0, 8)}...`);
 
-    // Create tunnel WITHOUT target_ip and target_port (ngrok-style)
+    // Determine final protocol
+    const finalProtocol = protocol || preset.protocol || 'tcp';
+
+    // Create tunnel
     const { data: tunnel, error: createError } = await supabase
       .from('tunnels')
       .insert([{
         user_id: req.user.id,
         subdomain,
         location,
+        service_type,
+        local_port,
+        remote_port: finalRemotePort,
+        protocol: finalProtocol,
         connection_token: connectionToken,
-        status: 'inactive', // Will be active when client connects
+        status: 'inactive',
         client_connected: false,
-        // NO target_ip and target_port - client will specify local address
       }])
       .select()
       .single();
@@ -115,14 +208,34 @@ router.post('/', authenticateToken, [
       return res.status(500).json({ message: 'Failed to create tunnel' });
     }
 
-    console.log(`✅ Tunnel created successfully: ${subdomain}.${location}.tunlify.biz.id`);
+    console.log(`✅ ${service_type.toUpperCase()} tunnel created successfully: ${subdomain}.${location}.tunlify.biz.id:${finalRemotePort}`);
     
+    // Prepare response based on service type
+    const tunnelUrl = finalProtocol === 'http' 
+      ? `https://${subdomain}.${location}.tunlify.biz.id`
+      : `${subdomain}.${location}.tunlify.biz.id:${finalRemotePort}`;
+
+    const clientCommand = finalProtocol === 'http'
+      ? `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port}`
+      : `./tunlify-client -token=${connectionToken} -local=127.0.0.1:${local_port} -protocol=${finalProtocol}`;
+
     res.status(201).json({
       ...tunnel,
-      tunnel_url: `https://${subdomain}.${location}.${process.env.TUNNEL_BASE_DOMAIN || 'tunlify.biz.id'}`,
+      service_info: {
+        name: preset.name,
+        description: preset.description,
+        protocol: finalProtocol
+      },
+      connection_info: {
+        host: `${subdomain}.${location}.tunlify.biz.id`,
+        port: finalRemotePort,
+        protocol: finalProtocol
+      },
+      tunnel_url: tunnelUrl,
       setup_instructions: {
         download_url: 'https://github.com/tunlify/client/releases/latest',
-        command: `./tunlify-client -token=${connectionToken} -local=127.0.0.1:3000`
+        command: clientCommand,
+        connection_examples: generateConnectionExamples(service_type, subdomain, location, finalRemotePort, finalProtocol)
       }
     });
 
@@ -131,6 +244,80 @@ router.post('/', authenticateToken, [
     res.status(500).json({ message: 'Internal server error' });
   }
 });
+
+// Generate connection examples for different services
+function generateConnectionExamples(serviceType, subdomain, location, port, protocol) {
+  const host = `${subdomain}.${location}.tunlify.biz.id`;
+  const examples = {};
+
+  switch (serviceType) {
+    case 'ssh':
+      examples.ssh = `ssh username@${host} -p ${port}`;
+      examples.scp = `scp -P ${port} file.txt username@${host}:/path/`;
+      examples.sftp = `sftp -P ${port} username@${host}`;
+      break;
+
+    case 'rdp':
+      examples.windows = `mstsc /v:${host}:${port}`;
+      examples.remmina = `remmina rdp://${host}:${port}`;
+      examples.freerdp = `xfreerdp /v:${host}:${port} /u:username`;
+      break;
+
+    case 'mysql':
+      examples.mysql_cli = `mysql -h ${host} -P ${port} -u username -p database_name`;
+      examples.connection_string = `mysql://username:password@${host}:${port}/database_name`;
+      examples.workbench = `Host: ${host}, Port: ${port}`;
+      break;
+
+    case 'postgresql':
+      examples.psql = `psql -h ${host} -p ${port} -U username -d database_name`;
+      examples.connection_string = `postgresql://username:password@${host}:${port}/database_name`;
+      examples.pgadmin = `Host: ${host}, Port: ${port}`;
+      break;
+
+    case 'mongodb':
+      examples.mongo_cli = `mongo mongodb://${host}:${port}/database_name`;
+      examples.connection_string = `mongodb://username:password@${host}:${port}/database_name`;
+      examples.compass = `mongodb://${host}:${port}`;
+      break;
+
+    case 'redis':
+      examples.redis_cli = `redis-cli -h ${host} -p ${port}`;
+      examples.connection_string = `redis://${host}:${port}`;
+      break;
+
+    case 'vnc':
+      examples.vnc_viewer = `${host}:${port}`;
+      examples.tightvnc = `vncviewer ${host}:${port}`;
+      break;
+
+    case 'ftp':
+      examples.ftp_cli = `ftp ${host} ${port}`;
+      examples.filezilla = `Host: ${host}, Port: ${port}, Protocol: FTP`;
+      break;
+
+    case 'smtp':
+      examples.smtp_config = `SMTP Server: ${host}, Port: ${port}`;
+      examples.telnet_test = `telnet ${host} ${port}`;
+      break;
+
+    case 'minecraft':
+      examples.minecraft_client = `Server Address: ${host}:${port}`;
+      examples.direct_connect = `${host}:${port}`;
+      break;
+
+    case 'http':
+    case 'https':
+      examples.browser = `https://${host}`;
+      examples.curl = `curl https://${host}`;
+      break;
+
+    default:
+      examples.generic = `Connect to ${host}:${port} using ${protocol.toUpperCase()} protocol`;
+  }
+
+  return examples;
+}
 
 // Delete tunnel
 router.delete('/:id', authenticateToken, async (req, res) => {
@@ -160,7 +347,7 @@ router.delete('/:id', authenticateToken, async (req, res) => {
       return res.status(500).json({ message: 'Failed to delete tunnel' });
     }
 
-    console.log(`🗑️ Tunnel deleted: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`);
+    console.log(`🗑️ Tunnel deleted: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`);
 
     res.json({ message: 'Tunnel deleted successfully' });
 
@@ -220,7 +407,7 @@ router.patch('/:id/status', authenticateToken, [
       return res.status(500).json({ message: 'Failed to update tunnel status' });
     }
 
-    console.log(`🔄 Tunnel status updated: ${tunnel.subdomain}.${tunnel.location} -> ${status} (connected: ${client_connected})`);
+    console.log(`🔄 Tunnel status updated: ${tunnel.subdomain}.${tunnel.location}:${tunnel.remote_port} -> ${status} (connected: ${client_connected})`);
 
     res.json(updatedTunnel);
 
@@ -250,7 +437,8 @@ router.post('/auth', [
       .from('tunnels')
       .select(`
         *,
-        users!tunnels_user_id_fkey(email, name)
+        users!tunnels_user_id_fkey(email, name),
+        server_locations!tunnels_location_fkey(name, ip_address)
       `)
       .eq('connection_token', connection_token)
       .single();
@@ -269,14 +457,25 @@ router.post('/auth', [
       })
       .eq('id', tunnel.id);
 
-    console.log(`🔗 Client connected: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`);
+    const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
+
+    console.log(`🔗 Client connected: ${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`);
     console.log(`👤 User: ${tunnel.users.email}`);
+    console.log(`🔧 Service: ${preset.name} (${tunnel.protocol})`);
 
     res.json({
       tunnel_id: tunnel.id,
       subdomain: tunnel.subdomain,
       location: tunnel.location,
-      tunnel_url: `https://${tunnel.subdomain}.${tunnel.location}.${process.env.TUNNEL_BASE_DOMAIN || 'tunlify.biz.id'}`,
+      local_port: tunnel.local_port,
+      remote_port: tunnel.remote_port,
+      protocol: tunnel.protocol,
+      service_type: tunnel.service_type,
+      service_name: preset.name,
+      tunnel_url: tunnel.protocol === 'http' 
+        ? `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`
+        : `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`,
+      server_ip: tunnel.server_locations.ip_address,
       user: tunnel.users.name
     });
 
