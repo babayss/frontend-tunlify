@@ -135,9 +135,11 @@ router.post('/', authenticateToken, [
     .isLength({ min: 2, max: 10 })
     .withMessage('Location must be 2-10 characters'),
   body('service_type')
+    .optional()
     .isIn(Object.keys(PORT_PRESETS))
     .withMessage('Invalid service type'),
   body('local_port')
+    .optional()
     .isInt({ min: 1, max: 65535 })
     .withMessage('Local port must be between 1-65535'),
   body('remote_port')
@@ -161,10 +163,19 @@ router.post('/', authenticateToken, [
       });
     }
 
-    const { subdomain, location, service_type, local_port, remote_port, protocol } = req.body;
-    const preset = PORT_PRESETS[service_type];
+    const { 
+      subdomain, 
+      location, 
+      service_type = 'custom', 
+      local_port = 3000, 
+      remote_port, 
+      protocol 
+    } = req.body;
+    
+    const preset = PORT_PRESETS[service_type] || PORT_PRESETS.custom;
 
     console.log(`🔍 Creating ${service_type} tunnel: ${subdomain}.${location} for user ${req.user.id}`);
+    console.log(`🔍 Preset info:`, preset);
 
     // Check if subdomain is already taken in this location
     const { data: existingTunnel } = await supabase
@@ -195,8 +206,9 @@ router.post('/', authenticateToken, [
 
     // Determine final protocol
     const finalProtocol = protocol || preset.protocol || 'tcp';
+    console.log(`🔍 Final protocol: ${finalProtocol}`);
 
-    // FIXED: Proper port assignment logic
+    // CRITICAL FIX: Proper port assignment logic
     let finalRemotePort = null;
     
     if (finalProtocol === 'http') {
@@ -220,7 +232,7 @@ router.post('/', authenticateToken, [
           });
         }
         
-        finalRemotePort = remote_port;
+        finalRemotePort = parseInt(remote_port);
         console.log(`🎯 Using user-specified port: ${finalRemotePort}`);
       } else {
         // Auto-assign a random port in safe range
@@ -238,21 +250,26 @@ router.post('/', authenticateToken, [
     const connectionToken = crypto.randomBytes(32).toString('hex');
     console.log(`🔑 Generated connection token: ${connectionToken.substring(0, 8)}...`);
 
+    // CRITICAL: Ensure we have valid data for database insert
+    const tunnelData = {
+      user_id: req.user.id,
+      subdomain,
+      location,
+      service_type,
+      local_port: parseInt(local_port),
+      remote_port: finalRemotePort, // null for HTTP, number for TCP/UDP
+      protocol: finalProtocol,
+      connection_token: connectionToken,
+      status: 'inactive',
+      client_connected: false,
+    };
+
+    console.log(`🔍 Tunnel data for database:`, tunnelData);
+
     // Create tunnel
     const { data: tunnel, error: createError } = await supabase
       .from('tunnels')
-      .insert([{
-        user_id: req.user.id,
-        subdomain,
-        location,
-        service_type,
-        local_port,
-        remote_port: finalRemotePort, // null for HTTP, number for TCP/UDP
-        protocol: finalProtocol,
-        connection_token: connectionToken,
-        status: 'inactive',
-        client_connected: false,
-      }])
+      .insert([tunnelData])
       .select()
       .single();
 
@@ -261,7 +278,9 @@ router.post('/', authenticateToken, [
       return res.status(500).json({ message: 'Failed to create tunnel' });
     }
 
-    // FIXED: Prepare response with proper URLs and commands
+    console.log(`✅ Tunnel created in database:`, tunnel);
+
+    // CRITICAL FIX: Prepare response with proper URLs and commands
     let tunnelUrl, clientCommand;
     
     if (finalProtocol === 'http') {
@@ -280,7 +299,7 @@ router.post('/', authenticateToken, [
       console.log(`   Remote Port: ${finalRemotePort}`);
     }
     
-    res.status(201).json({
+    const responseData = {
       ...tunnel,
       remote_port: finalRemotePort,
       service_info: {
@@ -299,7 +318,10 @@ router.post('/', authenticateToken, [
         command: clientCommand,
         connection_examples: generateConnectionExamples(service_type, subdomain, location, finalRemotePort, finalProtocol)
       }
-    });
+    };
+
+    console.log(`🔍 Response data:`, responseData);
+    res.status(201).json(responseData);
 
   } catch (error) {
     console.error('❌ Create tunnel error:', error);
@@ -494,7 +516,7 @@ router.patch('/:id/status', authenticateToken, [
   }
 });
 
-// Client authentication endpoint (for Golang client)
+// CRITICAL FIX: Client authentication endpoint with proper port handling
 router.post('/auth', [
   body('connection_token').isLength({ min: 32, max: 64 })
 ], async (req, res) => {
@@ -521,8 +543,19 @@ router.post('/auth', [
       .single();
 
     if (error || !tunnel) {
+      console.log(`❌ Invalid connection token: ${connection_token.substring(0, 8)}...`);
       return res.status(401).json({ message: 'Invalid connection token' });
     }
+
+    console.log(`🔍 Found tunnel for auth:`, {
+      id: tunnel.id,
+      subdomain: tunnel.subdomain,
+      location: tunnel.location,
+      service_type: tunnel.service_type,
+      protocol: tunnel.protocol,
+      local_port: tunnel.local_port,
+      remote_port: tunnel.remote_port
+    });
 
     // Update tunnel as connected
     await supabase
@@ -537,11 +570,16 @@ router.post('/auth', [
     const preset = PORT_PRESETS[tunnel.service_type] || PORT_PRESETS.custom;
     const protocol = tunnel.protocol || preset.protocol || 'tcp';
     
-    // FIXED: Proper tunnel URL generation for client response
+    // CRITICAL FIX: Proper tunnel URL generation for client response
     let tunnelUrl;
     if (protocol === 'http') {
       tunnelUrl = `https://${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id`;
     } else {
+      // ENSURE we have a valid remote_port for TCP/UDP
+      if (!tunnel.remote_port) {
+        console.error(`❌ No remote port for TCP/UDP tunnel: ${tunnel.id}`);
+        return res.status(500).json({ message: 'Invalid tunnel configuration - missing remote port' });
+      }
       tunnelUrl = `${tunnel.subdomain}.${tunnel.location}.tunlify.biz.id:${tunnel.remote_port}`;
     }
 
@@ -552,7 +590,7 @@ router.post('/auth', [
       console.log(`🎯 Remote Port: ${tunnel.remote_port}`);
     }
 
-    res.json({
+    const responseData = {
       tunnel_id: tunnel.id,
       subdomain: tunnel.subdomain,
       location: tunnel.location,
@@ -564,7 +602,10 @@ router.post('/auth', [
       tunnel_url: tunnelUrl,
       server_ip: tunnel.server_locations.ip_address,
       user: tunnel.users.name
-    });
+    };
+
+    console.log(`🔍 Auth response data:`, responseData);
+    res.json(responseData);
 
   } catch (error) {
     console.error('Client auth error:', error);
