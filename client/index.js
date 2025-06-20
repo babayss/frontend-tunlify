@@ -295,6 +295,7 @@ class TunlifyClient {
           if (this.protocol === 'http') {
             this.handleHttpRequest(message);
           } else {
+            this.log(`Received ${this.protocol.toUpperCase()} request: ${message.requestId}`, 'debug');
             this.handleTcpUdpRequest(message);
           }
           break;
@@ -378,6 +379,145 @@ class TunlifyClient {
         message: error.message
       }));
     }
+  }
+
+  // Enhanced TCP/UDP Request Handler
+  handleTcpUdpRequest(message) {
+    const { requestId, method, url: reqPath, headers, body } = message;
+    
+    this.log(`Handling ${this.protocol.toUpperCase()} request: ${requestId}`, 'debug');
+
+    if (this.protocol === 'tcp') {
+      // For TCP, establish a persistent connection
+      this.handleTcpRequest(message);
+    } else if (this.protocol === 'udp') {
+      // For UDP, handle as datagram
+      this.handleUdpRequest(message);
+    } else {
+      this.log(`Unsupported protocol for direct handling: ${this.protocol}`, 'error');
+      this.ws.send(JSON.stringify({
+        type: 'error',
+        requestId,
+        message: `Unsupported protocol: ${this.protocol}`
+      }));
+    }
+  }
+
+  // TCP Request Handler
+  handleTcpRequest(message) {
+    const { requestId, body } = message;
+    
+    // Create TCP connection to local service
+    const socket = net.createConnection({
+      host: this.localHost,
+      port: this.localPort
+    });
+
+    socket.on('connect', () => {
+      this.log(`TCP connection established for request: ${requestId}`, 'debug');
+      
+      // Send the request data if any
+      if (body) {
+        const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
+        socket.write(buffer);
+      }
+    });
+
+    socket.on('data', (data) => {
+      this.log(`TCP response data received: ${data.length} bytes`, 'debug');
+      
+      // Send response back through WebSocket
+      this.ws.send(JSON.stringify({
+        type: 'response',
+        requestId,
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+        encoding: 'base64',
+        body: data.toString('base64')
+      }));
+    });
+
+    socket.on('close', () => {
+      this.log(`TCP connection closed for request: ${requestId}`, 'debug');
+    });
+
+    socket.on('error', (error) => {
+      this.log(`TCP connection error for request ${requestId}: ${error.message}`, 'error');
+      
+      this.ws.send(JSON.stringify({
+        type: 'error',
+        requestId,
+        message: error.message
+      }));
+    });
+
+    // Store connection for potential cleanup
+    this.tcpConnections.set(requestId, socket);
+    
+    // Auto-cleanup after 30 seconds
+    setTimeout(() => {
+      if (this.tcpConnections.has(requestId)) {
+        socket.destroy();
+        this.tcpConnections.delete(requestId);
+      }
+    }, 30000);
+  }
+
+  // UDP Request Handler
+  handleUdpRequest(message) {
+    const { requestId, body } = message;
+    
+    const socket = dgram.createSocket('udp4');
+    
+    socket.on('message', (msg, rinfo) => {
+      this.log(`UDP response received: ${msg.length} bytes`, 'debug');
+      
+      // Send response back through WebSocket
+      this.ws.send(JSON.stringify({
+        type: 'response',
+        requestId,
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+        encoding: 'base64',
+        body: msg.toString('base64')
+      }));
+      
+      socket.close();
+    });
+
+    socket.on('error', (error) => {
+      this.log(`UDP socket error for request ${requestId}: ${error.message}`, 'error');
+      
+      this.ws.send(JSON.stringify({
+        type: 'error',
+        requestId,
+        message: error.message
+      }));
+      
+      socket.close();
+    });
+
+    // Send UDP packet
+    if (body) {
+      const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8');
+      socket.send(buffer, this.localPort, this.localHost, (error) => {
+        if (error) {
+          this.log(`UDP send error: ${error.message}`, 'error');
+          this.ws.send(JSON.stringify({
+            type: 'error',
+            requestId,
+            message: error.message
+          }));
+        }
+      });
+    }
+
+    // Auto-cleanup after 5 seconds for UDP
+    setTimeout(() => {
+      if (!socket.destroyed) {
+        socket.close();
+      }
+    }, 5000);
   }
 
   // TCP Connection Handler
@@ -486,12 +626,6 @@ class TunlifyClient {
     socket.send(buffer, this.localPort, this.localHost);
   }
 
-  // Handle TCP/UDP requests (placeholder for future implementation)
-  handleTcpUdpRequest(message) {
-    // This will be implemented when the backend supports direct TCP/UDP proxying
-    this.log(`TCP/UDP request handling not yet implemented: ${message.type}`, 'warn');
-  }
-
   sanitizeHeaders(headers) {
     const skipHeaders = new Set([
       'host', 'connection', 'upgrade', 'x-forwarded-for',
@@ -514,7 +648,7 @@ class TunlifyClient {
     console.log(chalk.cyan('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     
     console.log(chalk.bold('📋 Tunnel Information:'));
-    console.log(`   Service: ${chalk.yellow(this.tunnelInfo.service_name || 'Custom')}`);
+    console.log(`   Service: ${chalk.yellow(this.tunnelInfo.service_name || 'Custom Port')}`);
     console.log(`   Protocol: ${chalk.yellow(this.protocol.toUpperCase())}`);
     
     const localUrl = this.protocol === 'http' && this.isHttps
