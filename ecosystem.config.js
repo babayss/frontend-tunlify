@@ -1,7 +1,7 @@
 module.exports = {
   apps: [{
     name: 'tunlify-frontend',
-    script: 'npm',
+    script: 'npm run start',
     args: 'start',
     cwd: '/home/jony/tunlify-bolt',
     instances: 1,
