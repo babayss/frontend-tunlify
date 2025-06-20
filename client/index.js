@@ -657,6 +657,7 @@ class TunlifyClient {
     console.log(`   Local: ${chalk.yellow(localUrl)}`);
     console.log(`   Remote: ${chalk.yellow(this.tunnelInfo.tunnel_url)}`);
     
+    // FIXED: Only show remote port if it exists and is not null
     if (this.tunnelInfo.remote_port && this.protocol !== 'http') {
       console.log(`   Remote Port: ${chalk.yellow(this.tunnelInfo.remote_port)}`);
     }
@@ -670,48 +671,56 @@ class TunlifyClient {
 
   displayConnectionExamples() {
     const { service_type, tunnel_url, remote_port } = this.tunnelInfo;
+    
+    // FIXED: Handle cases where remote_port might be null
+    if (!tunnel_url) {
+      console.log(`   ${chalk.red('Error: Tunnel URL not available')}`);
+      return;
+    }
+    
     const host = tunnel_url.replace(/^https?:\/\//, '').split(':')[0];
+    const port = remote_port || 80; // Fallback to 80 if remote_port is null
     
     switch (service_type) {
       case 'ssh':
-        console.log(`   SSH: ${chalk.green(`ssh username@${host} -p ${remote_port}`)}`);
-        console.log(`   SCP: ${chalk.green(`scp -P ${remote_port} file.txt username@${host}:/path/`)}`);
+        console.log(`   SSH: ${chalk.green(`ssh username@${host} -p ${port}`)}`);
+        console.log(`   SCP: ${chalk.green(`scp -P ${port} file.txt username@${host}:/path/`)}`);
         break;
         
       case 'rdp':
-        console.log(`   Windows: ${chalk.green(`mstsc /v:${host}:${remote_port}`)}`);
-        console.log(`   Linux: ${chalk.green(`xfreerdp /v:${host}:${remote_port} /u:username`)}`);
+        console.log(`   Windows: ${chalk.green(`mstsc /v:${host}:${port}`)}`);
+        console.log(`   Linux: ${chalk.green(`xfreerdp /v:${host}:${port} /u:username`)}`);
         break;
         
       case 'mysql':
-        console.log(`   MySQL CLI: ${chalk.green(`mysql -h ${host} -P ${remote_port} -u username -p`)}`);
-        console.log(`   Connection String: ${chalk.green(`mysql://username:password@${host}:${remote_port}/database`)}`);
+        console.log(`   MySQL CLI: ${chalk.green(`mysql -h ${host} -P ${port} -u username -p`)}`);
+        console.log(`   Connection String: ${chalk.green(`mysql://username:password@${host}:${port}/database`)}`);
         break;
         
       case 'postgresql':
-        console.log(`   psql: ${chalk.green(`psql -h ${host} -p ${remote_port} -U username -d database`)}`);
-        console.log(`   Connection String: ${chalk.green(`postgresql://username:password@${host}:${remote_port}/database`)}`);
+        console.log(`   psql: ${chalk.green(`psql -h ${host} -p ${port} -U username -d database`)}`);
+        console.log(`   Connection String: ${chalk.green(`postgresql://username:password@${host}:${port}/database`)}`);
         break;
         
       case 'mongodb':
-        console.log(`   Mongo CLI: ${chalk.green(`mongo mongodb://${host}:${remote_port}/database`)}`);
-        console.log(`   Connection String: ${chalk.green(`mongodb://username:password@${host}:${remote_port}/database`)}`);
+        console.log(`   Mongo CLI: ${chalk.green(`mongo mongodb://${host}:${port}/database`)}`);
+        console.log(`   Connection String: ${chalk.green(`mongodb://username:password@${host}:${port}/database`)}`);
         break;
         
       case 'redis':
-        console.log(`   Redis CLI: ${chalk.green(`redis-cli -h ${host} -p ${remote_port}`)}`);
+        console.log(`   Redis CLI: ${chalk.green(`redis-cli -h ${host} -p ${port}`)}`);
         break;
         
       case 'vnc':
-        console.log(`   VNC Viewer: ${chalk.green(`${host}:${remote_port}`)}`);
+        console.log(`   VNC Viewer: ${chalk.green(`${host}:${port}`)}`);
         break;
         
       case 'ftp':
-        console.log(`   FTP: ${chalk.green(`ftp ${host} ${remote_port}`)}`);
+        console.log(`   FTP: ${chalk.green(`ftp ${host} ${port}`)}`);
         break;
         
       case 'minecraft':
-        console.log(`   Minecraft: ${chalk.green(`${host}:${remote_port}`)}`);
+        console.log(`   Minecraft: ${chalk.green(`${host}:${port}`)}`);
         break;
         
       case 'http':
@@ -724,10 +733,14 @@ class TunlifyClient {
         break;
         
       default:
-        if (this.protocol === 'tcp') {
-          console.log(`   TCP: ${chalk.green(`telnet ${host} ${remote_port}`)}`);
-        } else if (this.protocol === 'udp') {
-          console.log(`   UDP: ${chalk.green(`nc -u ${host} ${remote_port}`)}`);
+        if (this.protocol === 'tcp' && remote_port) {
+          console.log(`   TCP: ${chalk.green(`telnet ${host} ${port}`)}`);
+        } else if (this.protocol === 'udp' && remote_port) {
+          console.log(`   UDP: ${chalk.green(`nc -u ${host} ${port}`)}`);
+        } else if (this.protocol === 'http') {
+          console.log(`   Browser: ${chalk.green(tunnel_url)}`);
+        } else {
+          console.log(`   Connect to: ${chalk.green(tunnel_url)}`);
         }
     }
   }
